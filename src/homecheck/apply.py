@@ -181,17 +181,24 @@ def _is_within(path: Path, root: Path) -> bool:
 
 
 # --------------------------------------------------------------------------
-# S7：执行计划（把冗余副本移入隔离目录）
+# S7 / S8：执行（移入隔离目录，或不可逆删除）
 # --------------------------------------------------------------------------
 
 #: 执行结果状态：已移动
 MOVED = "moved"
+#: 执行结果状态：已删除（不可逆）
+DELETED = "deleted"
 #: 执行结果状态：用户拒绝，未改动
 SKIPPED = "skipped"
-#: 执行结果状态：复核未通过或移动失败
+#: 执行结果状态：复核未通过或操作失败
 REFUSED = "refused"
 
-#: 审计清单的文件名（写在隔离目录内）
+#: 执行模式：移入隔离目录（可恢复）
+MODE_QUARANTINE = "quarantine"
+#: 执行模式：不可逆删除
+MODE_DELETE = "delete"
+
+#: 审计清单的文件名（隔离模式下写在隔离目录内）
 MANIFEST_NAME = "manifest.json"
 
 #: 审计清单的 schema 版本
@@ -211,17 +218,56 @@ class ExecutionOutcome:
 class ExecutionResult:
     """一次执行的完整结果。"""
 
-    quarantine: Path
+    mode: str
     manifest: Path
+    #: 隔离模式下是隔离目录；删除模式下为 ``None``
+    quarantine: Path | None = None
     outcomes: list[ExecutionOutcome] = field(default_factory=list)
 
     def _count(self, status: str) -> int:
         return sum(1 for outcome in self.outcomes if outcome.status == status)
 
+    def _bytes(self, status: str) -> int:
+        return sum(
+            outcome.action.size
+            for outcome in self.outcomes
+            if outcome.status == status
+        )
+
+    @property
+    def is_delete(self) -> bool:
+        """本次是否为不可逆删除。"""
+        return self.mode == MODE_DELETE
+
+    @property
+    def succeeded_count(self) -> int:
+        """已完成的动作数（移动或删除）。"""
+        return self._count(MOVED) + self._count(DELETED)
+
+    @property
+    def succeeded_bytes(self) -> int:
+        """已完成动作合计的字节数。"""
+        return self._bytes(MOVED) + self._bytes(DELETED)
+
     @property
     def moved_count(self) -> int:
         """成功移入隔离目录的动作数。"""
         return self._count(MOVED)
+
+    @property
+    def moved_bytes(self) -> int:
+        """已移动文件合计的字节数。"""
+        return self._bytes(MOVED)
+
+    @property
+    def deleted_count(self) -> int:
+        """已不可逆删除的动作数。"""
+        return self._count(DELETED)
+
+    @property
+    def deleted_bytes(self) -> int:
+        """已删除文件合计的字节数。"""
+        return self._bytes(DELETED)
 
     @property
     def skipped_count(self) -> int:
@@ -230,17 +276,8 @@ class ExecutionResult:
 
     @property
     def refused_count(self) -> int:
-        """复核未通过或移动失败的动作数。"""
+        """复核未通过或操作失败的动作数。"""
         return self._count(REFUSED)
-
-    @property
-    def moved_bytes(self) -> int:
-        """已移动文件合计的字节数。"""
-        return sum(
-            outcome.action.size
-            for outcome in self.outcomes
-            if outcome.status == MOVED
-        )
 
 
 def apply_plan(
@@ -250,10 +287,7 @@ def apply_plan(
     confirm: Callable[[Action, int, int], bool] | None = None,
     timestamp: datetime | None = None,
 ) -> ExecutionResult:
-    """按 *plan* 把冗余副本移入 *quarantine*。
-
-    这是本项目**唯一会改动文件系统**的函数，因此做了三重保护：
-    隔离目录必须干净、审计清单先落盘、每个动作执行前重新校验。
+    """按 *plan* 把冗余副本移入 *quarantine*（**可恢复**）。
 
     参数:
         plan: 要执行的计划，通常来自 :func:`build_plan`。
@@ -264,24 +298,88 @@ def apply_plan(
         timestamp: 审计清单的时间戳；默认取当前时间。
 
     返回:
-        ``ExecutionResult``，其中逐条记录了 moved / skipped / refused。
+        ``ExecutionResult``，``mode`` 为 ``quarantine``。
 
     异常:
         FileExistsError: *quarantine* 已被占用或非空 —— 拒绝覆盖任何东西。
     """
-    quarantine = Path(quarantine)
-    if quarantine.exists():
-        if not quarantine.is_dir():
-            raise FileExistsError(f"隔离目录路径已被占用: {quarantine}")
-        if any(quarantine.iterdir()):
-            raise FileExistsError(f"隔离目录非空，拒绝使用: {quarantine}")
-    else:
-        quarantine.mkdir(parents=True)
+    quarantine = _ensure_clean_directory(Path(quarantine), "隔离目录")
+    return _execute(
+        plan,
+        mode=MODE_QUARANTINE,
+        manifest=quarantine / MANIFEST_NAME,
+        quarantine=quarantine,
+        handler=lambda action: (
+            "已移至 "
+            f"{_move_into_quarantine(action.path, quarantine, plan.root)}"
+        ),
+        verb="移动",
+        success_status=MOVED,
+        confirm=confirm,
+        timestamp=timestamp,
+    )
 
-    manifest = quarantine / MANIFEST_NAME
-    _write_manifest(manifest, plan, quarantine, timestamp)
 
-    result = ExecutionResult(quarantine=quarantine, manifest=manifest)
+def delete_plan(
+    plan: ActionPlan,
+    *,
+    manifest_path: Path,
+    confirm: Callable[[Action, int, int], bool] | None = None,
+    timestamp: datetime | None = None,
+) -> ExecutionResult:
+    """按 *plan* **不可逆删除**冗余副本。
+
+    **这是整个项目唯一会销毁数据的函数。** 调用方必须已经拿到显式且
+    不可误触的授权 —— CLI 层用 ``--delete --confirm-delete DELETE`` 双开关把关。
+
+    删除前的复核比移动更关键：删掉之后没有任何东西可以还原。
+
+    参数:
+        plan: 要执行的计划。
+        manifest_path: 审计清单的写入路径，**必须不存在**（拒绝覆盖）。
+            清单在任何删除之前落盘，是事后唯一的记录。
+        confirm: 逐条确认回调；``None`` 表示不询问。
+        timestamp: 审计清单的时间戳；默认取当前时间。
+
+    返回:
+        ``ExecutionResult``，``mode`` 为 ``delete``。
+
+    异常:
+        FileExistsError: *manifest_path* 已存在。
+    """
+    manifest = Path(manifest_path)
+    manifest.parent.mkdir(parents=True, exist_ok=True)
+    if manifest.exists():
+        raise FileExistsError(f"审计清单路径已存在，拒绝覆盖: {manifest}")
+    return _execute(
+        plan,
+        mode=MODE_DELETE,
+        manifest=manifest,
+        quarantine=None,
+        handler=lambda action: _unlink(action.path),
+        verb="删除",
+        success_status=DELETED,
+        confirm=confirm,
+        timestamp=timestamp,
+    )
+
+
+def _execute(
+    plan: ActionPlan,
+    *,
+    mode: str,
+    manifest: Path,
+    quarantine: Path | None,
+    handler: Callable[[Action], str],
+    verb: str,
+    success_status: str,
+    confirm: Callable[[Action, int, int], bool] | None,
+    timestamp: datetime | None,
+) -> ExecutionResult:
+    """移动与删除共用的执行骨架：先落审计清单，再逐个复核并处理。"""
+    _write_manifest(manifest, plan, quarantine, timestamp, mode=mode)
+
+    result = ExecutionResult(mode=mode, manifest=manifest, quarantine=quarantine)
     total = len(plan.actions)
 
     for index, action in enumerate(plan.actions, start=1):
@@ -293,16 +391,38 @@ def apply_plan(
             result.outcomes.append(ExecutionOutcome(action, SKIPPED, "用户拒绝"))
             continue
         try:
-            destination = _move_into_quarantine(action.path, quarantine, plan.root)
+            detail = handler(action)
         except OSError as exc:
-            detail = exc.strerror or str(exc)
+            message = exc.strerror or str(exc)
             result.outcomes.append(
-                ExecutionOutcome(action, REFUSED, f"移动失败: {detail}")
+                ExecutionOutcome(action, REFUSED, f"{verb}失败: {message}")
             )
             continue
-        result.outcomes.append(ExecutionOutcome(action, MOVED, f"已移至 {destination}"))
+        result.outcomes.append(ExecutionOutcome(action, success_status, detail))
 
     return result
+
+
+def _ensure_clean_directory(path: Path, label: str) -> Path:
+    """确认 *path* 可安全用作输出目录：不存在则创建，存在则必须为空。"""
+    if path.exists():
+        if not path.is_dir():
+            raise FileExistsError(f"{label}路径已被占用: {path}")
+        if any(path.iterdir()):
+            raise FileExistsError(f"{label}非空，拒绝使用: {path}")
+    else:
+        path.mkdir(parents=True)
+    return path
+
+
+def _unlink(path: Path) -> str:
+    """不可逆删除单个文件。
+
+    只用 ``Path.unlink()``：不经过 shell、不递归、且调用前已复核过
+    它是普通文件而非目录或符号链接。
+    """
+    path.unlink()
+    return f"已删除 {path}"
 
 
 def execution_refusal(action: Action, root: Path) -> str | None:
@@ -364,17 +484,20 @@ def _move_into_quarantine(path: Path, quarantine: Path, root: Path) -> Path:
 def _write_manifest(
     manifest: Path,
     plan: ActionPlan,
-    quarantine: Path,
+    quarantine: Path | None,
     timestamp: datetime | None,
+    *,
+    mode: str = MODE_QUARANTINE,
 ) -> None:
-    """在隔离目录内写下审计清单。必须在任何移动之前调用。"""
+    """写下审计清单。**必须在任何移动或删除之前调用。**"""
     moment = timestamp or datetime.now()
     payload = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "tool": "homecheck",
+        "mode": mode,
         "created_at": moment.strftime("%Y-%m-%dT%H:%M:%S"),
         "root": str(plan.root),
-        "quarantine": str(quarantine),
+        "quarantine": str(quarantine) if quarantine is not None else None,
         "action_count": len(plan.actions),
         "total_bytes": plan.total_bytes,
         "truncated": plan.truncated,

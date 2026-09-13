@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from .apply import MOVED, ActionPlan, ExecutionResult
+from .apply import DELETED, MOVED, ActionPlan, ExecutionResult
 from .duplicates import DuplicateReport
 from .scan import ROOT_LABEL, ScanResult
 from .suggest import Suggestion
@@ -340,15 +340,26 @@ def render_markdown(
     if execution is not None:
         lines.append("## 执行结果")
         lines.append("")
-        lines.append(f"- **隔离目录**：`{execution.quarantine}`")
-        lines.append(f"- **审计清单**：`{execution.manifest}`")
-        lines.append(
-            f"- **已移动**：{execution.moved_count} 个 / {human_size(execution.moved_bytes)}"
-        )
+        if execution.is_delete:
+            lines.append("- **模式**：不可逆删除")
+            lines.append(f"- **审计清单**：`{execution.manifest}`")
+            lines.append(
+                f"- **已删除**：{execution.deleted_count} 个 / "
+                f"{human_size(execution.deleted_bytes)}"
+            )
+            done_status = DELETED
+        else:
+            lines.append(f"- **隔离目录**：`{execution.quarantine}`")
+            lines.append(f"- **审计清单**：`{execution.manifest}`")
+            lines.append(
+                f"- **已移动**：{execution.moved_count} 个 / "
+                f"{human_size(execution.moved_bytes)}"
+            )
+            done_status = MOVED
         lines.append(f"- **已跳过**：{execution.skipped_count} 个（用户拒绝）")
         lines.append(f"- **已拒绝**：{execution.refused_count} 个（复核未通过）")
         lines.append("")
-        failures = [item for item in execution.outcomes if item.status != MOVED]
+        failures = [item for item in execution.outcomes if item.status != done_status]
         if failures:
             lines.extend(
                 _md_table(
@@ -360,7 +371,10 @@ def render_markdown(
                 )
             )
             lines.append("")
-        lines.append("> 恢复方式：把隔离目录中的文件按原相对路径移回原位即可。")
+        if execution.is_delete:
+            lines.append("> ⚠ 删除不可撤销。若要保留退路，请改用 `--quarantine`。")
+        else:
+            lines.append("> 恢复方式：把隔离目录中的文件按原相对路径移回原位即可。")
         lines.append("")
 
     if result.issues:
@@ -463,20 +477,35 @@ def _render_execution(execution: ExecutionResult) -> list[str]:
     未成功的动作会逐条列出原因 —— 尤其是"保留项已变化"这类
     本会丢数据的拒绝，必须让用户看见。
     """
-    lines = ["执行结果（已移入隔离目录，可恢复）"]
-    lines.append(f"  隔离目录  {execution.quarantine}")
-    lines.append(f"  审计清单  {execution.manifest}")
-    lines.append(
-        f"  已移动    {execution.moved_count} 个 / {human_size(execution.moved_bytes)}"
-    )
+    if execution.is_delete:
+        lines = ["执行结果（不可逆删除）"]
+        lines.append(f"  审计清单  {execution.manifest}")
+        lines.append(
+            f"  已删除    {execution.deleted_count} 个 / "
+            f"{human_size(execution.deleted_bytes)}"
+        )
+        done_status = DELETED
+    else:
+        lines = ["执行结果（已移入隔离目录，可恢复）"]
+        lines.append(f"  隔离目录  {execution.quarantine}")
+        lines.append(f"  审计清单  {execution.manifest}")
+        lines.append(
+            f"  已移动    {execution.moved_count} 个 / "
+            f"{human_size(execution.moved_bytes)}"
+        )
+        done_status = MOVED
+
     lines.append(f"  已跳过    {execution.skipped_count} 个（用户拒绝）")
     lines.append(f"  已拒绝    {execution.refused_count} 个（复核未通过）")
     for outcome in execution.outcomes:
-        if outcome.status == MOVED:
+        if outcome.status == done_status:
             continue
         lines.append(f"      ✗ {outcome.action.path} — {outcome.detail}")
     lines.append("")
-    lines.append("  恢复方式：把隔离目录中的文件按原相对路径移回原位即可。")
+    if execution.is_delete:
+        lines.append("  ⚠ 删除不可撤销。若要保留退路，请改用 --quarantine（可恢复）。")
+    else:
+        lines.append("  恢复方式：把隔离目录中的文件按原相对路径移回原位即可。")
     lines.append("")
     return lines
 
@@ -550,10 +579,15 @@ def _execution_payload(execution: ExecutionResult | None) -> dict[str, object] |
     if execution is None:
         return None
     return {
-        "quarantine": str(execution.quarantine),
+        "mode": execution.mode,
+        "quarantine": (
+            str(execution.quarantine) if execution.quarantine is not None else None
+        ),
         "manifest": str(execution.manifest),
         "moved_count": execution.moved_count,
         "moved_bytes": execution.moved_bytes,
+        "deleted_count": execution.deleted_count,
+        "deleted_bytes": execution.deleted_bytes,
         "skipped_count": execution.skipped_count,
         "refused_count": execution.refused_count,
         "outcomes": [

@@ -1,7 +1,8 @@
 """``apply`` 模块的单元测试。
 
-S5 的核心承诺是「只出计划、绝不动手」，所以测试重点在**安全规则**上：
-宁可少删，也不能多删。
+核心承诺是「**宁可少删，也不能多删**」，所以测试重点在安全规则上：
+计划阶段的拒绝规则（S5）、执行前的复核（S7）、以及不可逆删除的
+双重把关（S8）。每个"拒绝"用例都同时断言**文件仍然存在**。
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from homecheck.apply import Action, ActionPlan, apply_plan, build_plan
+from homecheck.apply import Action, ActionPlan, apply_plan, build_plan, delete_plan
 from homecheck.duplicates import DuplicateGroup, DuplicateReport, hash_file
 from homecheck.scan import FileRecord, ScanResult
 
@@ -434,6 +435,176 @@ class ApplyPlanTest(unittest.TestCase):
         self.assertEqual(result.refused_count, 1)
         self.assertFalse(good.exists())
         self.assertTrue(stale.exists())
+
+
+class DeletePlanTest(unittest.TestCase):
+    """针对 ``delete_plan``（S8，唯一会销毁数据的函数）的测试。
+
+    每个"拒绝"用例都断言目标文件**仍然存在** —— 这是本项目最重要的一条不变量。
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.base = Path(self._tmp.name)
+        self.root = self.base / "scan"
+        self.root.mkdir()
+        self.manifest = self.base / "audit.json"
+
+    def write(self, relative: str, payload: bytes) -> Path:
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+        return path
+
+    def action_for(self, path: Path, keep: Path) -> Action:
+        return Action(
+            kind="delete-duplicate",
+            path=path,
+            size=path.stat().st_size,
+            digest=hash_file(path),
+            keep=keep,
+            reason="test",
+        )
+
+    def plan(self, actions: list[Action]) -> ActionPlan:
+        return ActionPlan(root=self.root, actions=list(actions))
+
+    def pair(self) -> tuple[Path, Path, ActionPlan]:
+        keep = self.write("keep.bin", b"x" * 100)
+        redundant = self.write("redundant.bin", b"x" * 100)
+        return keep, redundant, self.plan([self.action_for(redundant, keep)])
+
+    def test_deletes_redundant_and_keeps_the_other(self) -> None:
+        keep, redundant, plan = self.pair()
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertTrue(result.is_delete)
+        self.assertEqual(result.mode, "delete")
+        self.assertEqual(result.deleted_count, 1)
+        self.assertEqual(result.deleted_bytes, 100)
+        self.assertFalse(redundant.exists())
+        self.assertTrue(keep.exists())
+        self.assertIsNone(result.quarantine)
+
+    def test_manifest_records_delete_mode(self) -> None:
+        _, _, plan = self.pair()
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        payload = json.loads(result.manifest.read_text(encoding="utf-8"))
+        self.assertEqual(payload["mode"], "delete")
+        self.assertIsNone(payload["quarantine"])
+        self.assertEqual(payload["action_count"], 1)
+
+    def test_manifest_is_written_before_deleting(self) -> None:
+        """清单里记录的路径此时应已不存在 —— 证明它是删除前写的。"""
+        _, _, plan = self.pair()
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        payload = json.loads(result.manifest.read_text(encoding="utf-8"))
+        self.assertFalse(Path(payload["actions"][0]["path"]).exists())
+
+    def test_refuses_when_kept_copy_is_gone(self) -> None:
+        keep, redundant, plan = self.pair()
+        keep.unlink()
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertEqual(result.deleted_count, 0)
+        self.assertEqual(result.refused_count, 1)
+        self.assertTrue(redundant.exists())  # ← 最关键的一条
+        self.assertIn("保留项不可用", result.outcomes[0].detail)
+
+    def test_refuses_when_kept_copy_changed(self) -> None:
+        keep, redundant, plan = self.pair()
+        keep.write_bytes(b"z" * 100)
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertEqual(result.refused_count, 1)
+        self.assertTrue(redundant.exists())
+        self.assertIn("保留项内容已变化", result.outcomes[0].detail)
+
+    def test_refuses_when_target_content_changed(self) -> None:
+        _, redundant, plan = self.pair()
+        redundant.write_bytes(b"q" * 100)
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertEqual(result.refused_count, 1)
+        self.assertTrue(redundant.exists())
+
+    def test_refuses_target_outside_root(self) -> None:
+        outside = self.base / "outside.bin"
+        outside.write_bytes(b"x" * 10)
+        keep = self.write("keep.bin", b"x" * 10)
+        plan = self.plan([self.action_for(outside, keep)])
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertEqual(result.refused_count, 1)
+        self.assertTrue(outside.exists())
+
+    def test_declined_confirmation_keeps_file(self) -> None:
+        _, redundant, plan = self.pair()
+
+        result = delete_plan(
+            plan, manifest_path=self.manifest, confirm=lambda *_: False
+        )
+
+        self.assertEqual(result.skipped_count, 1)
+        self.assertEqual(result.deleted_count, 0)
+        self.assertTrue(redundant.exists())
+
+    def test_refuses_existing_manifest_path(self) -> None:
+        self.manifest.write_text("already here", encoding="utf-8")
+        _, redundant, plan = self.pair()
+
+        with self.assertRaises(FileExistsError):
+            delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertTrue(redundant.exists())
+
+    def test_never_removes_every_copy(self) -> None:
+        keep = self.write("keep.bin", b"x" * 100)
+        first = self.write("r1.bin", b"x" * 100)
+        second = self.write("r2.bin", b"x" * 100)
+        plan = self.plan(
+            [self.action_for(first, keep), self.action_for(second, keep)]
+        )
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertEqual(result.deleted_count, 2)
+        self.assertTrue(keep.exists())
+        self.assertFalse(first.exists())
+        self.assertFalse(second.exists())
+
+    def test_mixed_outcomes(self) -> None:
+        keep_a = self.write("a_keep.bin", b"1" * 10)
+        good = self.write("a_dup.bin", b"1" * 10)
+        keep_b = self.write("b_keep.bin", b"2" * 10)
+        stale = self.write("b_dup.bin", b"2" * 10)
+        plan = self.plan(
+            [self.action_for(good, keep_a), self.action_for(stale, keep_b)]
+        )
+        stale.write_bytes(b"changed!!")
+
+        result = delete_plan(plan, manifest_path=self.manifest)
+
+        self.assertEqual(result.deleted_count, 1)
+        self.assertEqual(result.refused_count, 1)
+        self.assertFalse(good.exists())
+        self.assertTrue(stale.exists())
+
+    def test_empty_plan_still_writes_manifest(self) -> None:
+        result = delete_plan(self.plan([]), manifest_path=self.manifest)
+
+        self.assertTrue(result.manifest.exists())
+        self.assertEqual(result.deleted_count, 0)
 
 
 if __name__ == "__main__":

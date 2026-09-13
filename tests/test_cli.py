@@ -204,10 +204,13 @@ class MainTest(unittest.TestCase):
         self.assertEqual(
             set(payload["execution"]),
             {
+                "mode",
                 "quarantine",
                 "manifest",
                 "moved_count",
                 "moved_bytes",
+                "deleted_count",
+                "deleted_bytes",
                 "skipped_count",
                 "refused_count",
                 "outcomes",
@@ -225,6 +228,166 @@ class MainTest(unittest.TestCase):
 
         self.assertEqual(code, EXIT_OK)
         self.assertIn("## 执行结果", out)
+
+    def test_apply_requires_a_destination(self) -> None:
+        code, _, err = self.run_main(["--apply", "--yes", str(self.root)])
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("--quarantine", err)
+        self.assertTrue((self.root / "copy.bin").exists())
+
+    def test_delete_and_quarantine_are_mutually_exclusive(self) -> None:
+        code, _, err = self.run_main(
+            [
+                "--apply",
+                "--delete",
+                "--confirm-delete",
+                "DELETE",
+                "--manifest",
+                str(self.base / "a.json"),
+                "--quarantine",
+                str(self.base / "q"),
+                "--yes",
+                str(self.root),
+            ]
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("互斥", err)
+        self.assertTrue((self.root / "copy.bin").exists())
+
+    def test_delete_requires_token(self) -> None:
+        manifest = self.base / "audit.json"
+
+        code, _, err = self.run_main(
+            [
+                "--apply",
+                "--delete",
+                "--manifest",
+                str(manifest),
+                "--yes",
+                str(self.root),
+            ]
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("DELETE", err)
+        self.assertTrue((self.root / "copy.bin").exists())
+        self.assertFalse(manifest.exists())
+
+    def test_delete_rejects_wrong_token(self) -> None:
+        manifest = self.base / "audit.json"
+
+        code, _, _ = self.run_main(
+            [
+                "--apply",
+                "--delete",
+                "--confirm-delete",
+                "delete",  # 大小写不符
+                "--manifest",
+                str(manifest),
+                "--yes",
+                str(self.root),
+            ]
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertTrue((self.root / "copy.bin").exists())
+        self.assertFalse(manifest.exists())
+
+    def test_delete_requires_manifest(self) -> None:
+        code, _, err = self.run_main(
+            [
+                "--apply",
+                "--delete",
+                "--confirm-delete",
+                "DELETE",
+                "--yes",
+                str(self.root),
+            ]
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+        self.assertIn("--manifest", err)
+        self.assertTrue((self.root / "copy.bin").exists())
+
+    def test_manifest_without_delete_is_refused(self) -> None:
+        code, _, _ = self.run_main(
+            ["--manifest", str(self.base / "a.json"), str(self.root)]
+        )
+
+        self.assertEqual(code, EXIT_USAGE)
+
+    def test_delete_refuses_existing_manifest(self) -> None:
+        manifest = self.base / "audit.json"
+        manifest.write_text("already here", encoding="utf-8")
+
+        code, _, err = self.run_main(
+            [
+                "--apply",
+                "--delete",
+                "--confirm-delete",
+                "DELETE",
+                "--manifest",
+                str(manifest),
+                "--yes",
+                str(self.root),
+            ]
+        )
+
+        self.assertEqual(code, EXIT_PRECONDITION)
+        self.assertIn("已存在", err)
+        self.assertTrue((self.root / "copy.bin").exists())
+
+    def test_delete_with_full_authorization(self) -> None:
+        manifest = self.base / "audit.json"
+
+        code, out, _ = self.run_main(
+            [
+                "--apply",
+                "--delete",
+                "--confirm-delete",
+                "DELETE",
+                "--manifest",
+                str(manifest),
+                "--yes",
+                "--json",
+                str(self.root),
+            ]
+        )
+
+        payload = json.loads(out)
+        self.assertEqual(code, EXIT_OK)
+        self.assertEqual(payload["execution"]["mode"], "delete")
+        self.assertEqual(payload["execution"]["deleted_count"], 1)
+        self.assertIsNone(payload["execution"]["quarantine"])
+        self.assertTrue(manifest.exists())
+        # 保留的那一份必须还在，被删的那一份必须没了
+        remaining = [
+            p for p in (self.root / "a.bin", self.root / "copy.bin") if p.exists()
+        ]
+        self.assertEqual(len(remaining), 1)
+
+    def test_delete_markdown_shows_irreversible_warning(self) -> None:
+        manifest = self.base / "audit.json"
+
+        code, out, _ = self.run_main(
+            [
+                "--apply",
+                "--delete",
+                "--confirm-delete",
+                "DELETE",
+                "--manifest",
+                str(manifest),
+                "--yes",
+                "--markdown",
+                str(self.root),
+            ]
+        )
+
+        self.assertEqual(code, EXIT_OK)
+        self.assertIn("## 执行结果", out)
+        self.assertIn("不可逆删除", out)
 
     def test_min_duplicate_bytes_filters_small_files(self) -> None:
         code, out, _ = self.run_main(
