@@ -1,25 +1,54 @@
 # homecheck
 
-只读的本机环境体检工具：扫描目录，输出体积报告。
-**默认不产生任何写入。**
+只读的本机环境体检工具：扫描目录，找出重复文件，给出体积报告与清理建议。
+**默认不产生任何写入，也永远不会自己执行删除。**
 
 ## 状态
 
-S1（只读扫描 + 体积统计）已实现。规格见 `docs/SPEC-S1.md`。
+S1–S4 已实现：扫描统计、重复检测、JSON / Markdown 导出、建议引擎。
+S5（安全的 apply 流程）与 S6（测试硬化）待做。
 
 ## 运行
 
 无需安装任何依赖（Python 3.12+，仅用标准库）：
 
 ```bash
-PYTHONPATH=src python3 -m homecheck ~/Downloads --top 5
-```
+cd ~/projects/homecheck
 
-不传路径时默认扫描**当前目录**（不会扫整个 home）：
+# 基本扫描
+PYTHONPATH=src python3 -m homecheck ~/Downloads --top 10
 
-```bash
+# 不传路径 = 扫描当前目录（不会扫整个 home）
 PYTHONPATH=src python3 -m homecheck
+
+# 只看大文件重复，过滤 node_modules 之类的小文件噪音
+PYTHONPATH=src python3 -m homecheck ~/code --min-duplicate-bytes 1048576
+
+# 给脚本消费（stdout 只有 JSON）
+PYTHONPATH=src python3 -m homecheck . --json > report.json
+
+# 给人看（Markdown）
+PYTHONPATH=src python3 -m homecheck . --markdown
+
+# 只扫一层，跳过查重，快
+PYTHONPATH=src python3 -m homecheck / --max-depth 1 --skip-duplicates
 ```
+
+## 选项
+
+| 选项 | 说明 | 默认 |
+|---|---|---|
+| `路径` | 扫描根 | `.`（当前目录） |
+| `--top N` | 排行/分布/重复组各显示前 N 项 | 20 |
+| `--max-depth N` | 限制遍历深度，根为第 0 层 | 不限 |
+| `--json` | 输出 JSON（stdout 只有 JSON） | 关 |
+| `--markdown` | 输出 Markdown | 关 |
+| `--skip-duplicates` | 跳过查重，更快 | 关 |
+| `--min-duplicate-bytes N` | 参与查重的最小体积 | 1（忽略空文件） |
+| `--large-bytes N` | 大文件阈值 | 104857600（100 MB） |
+| `--stale-days N` | 陈旧阈值 | 180 |
+
+`--json` 与 `--markdown` 互斥。
 
 ## 测试
 
@@ -29,9 +58,13 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 
 ## 安全承诺
 
-- 不传 `--apply` 时，程序对文件系统**零写入**
+- 不传 `--apply`（尚未实现）时，程序对文件系统**零写入** —— 包括**报告也只写 stdout**，
+  落盘请自行重定向（见 `DECISIONS.md` ADR-0008）
 - 不跟随符号链接，避免循环与重复计数
 - 权限不足的目录**跳过并如实汇报**，绝不静默吞掉
+- 硬链接不虚报可回收空间
+- 建议里的删除命令一律 `shlex.quote` 转义，**绝不使用 `-r` / `-f`**，
+  并且**本工具永不执行它们**
 - 完整的非目标清单见 `docs/PRODUCT.md` 第 4 节
 
 ## 文档
@@ -40,6 +73,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 |---|---|
 | `docs/PRODUCT.md` | 做什么 / 不做什么 |
 | `docs/SPEC-S1.md` | S1 切片规格 |
+| `docs/SPEC-S2-S4.md` | S2–S4 合并规格与决策清单 D1–D14 |
 | `docs/DECISIONS.md` | 决策记录（ADR） |
 | `docs/CONVENTIONS.md` | 编码与协作约定 |
 | `docs/TASKS.md` | 进度 |

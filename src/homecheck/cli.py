@@ -1,6 +1,7 @@
-"""命令行入口：解析参数、执行只读扫描、打印报告。
+"""命令行入口：解析参数、执行只读扫描与查重、渲染报告。
 
 本模块只读：除向 stdout / stderr 写文本外，不产生任何文件系统改动。
+报告落盘请由用户用 shell 重定向完成（CONVENTIONS §6）。
 """
 
 from __future__ import annotations
@@ -12,8 +13,10 @@ import time
 from pathlib import Path
 from typing import NoReturn
 
-from .report import render_report
+from .duplicates import DuplicateReport, find_duplicates
+from .report import render_json, render_markdown, render_report
 from .scan import scan_directory
+from .suggest import DEFAULT_LARGE_BYTES, DEFAULT_STALE_DAYS, build_suggestions
 
 EXIT_OK = 0
 EXIT_USAGE = 1
@@ -54,6 +57,45 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="N",
         help="限制遍历深度，根目录为第 0 层（默认：不限）",
     )
+
+    formats = parser.add_mutually_exclusive_group()
+    formats.add_argument(
+        "--json",
+        action="store_true",
+        help="输出 JSON 到 stdout（stdout 只有 JSON，可被脚本消费）",
+    )
+    formats.add_argument(
+        "--markdown",
+        action="store_true",
+        help="输出 Markdown 到 stdout",
+    )
+
+    parser.add_argument(
+        "--skip-duplicates",
+        action="store_true",
+        help="跳过重复文件检测（大目录下更快，代价是不产出清理建议）",
+    )
+    parser.add_argument(
+        "--min-duplicate-bytes",
+        type=int,
+        default=1,
+        metavar="N",
+        help="参与查重的最小体积，单位字节（默认：1，即忽略空文件）",
+    )
+    parser.add_argument(
+        "--large-bytes",
+        type=int,
+        default=DEFAULT_LARGE_BYTES,
+        metavar="N",
+        help=f"大文件阈值，单位字节（默认：{DEFAULT_LARGE_BYTES}，即 100 MB）",
+    )
+    parser.add_argument(
+        "--stale-days",
+        type=int,
+        default=DEFAULT_STALE_DAYS,
+        metavar="N",
+        help=f"陈旧阈值，单位天（默认：{DEFAULT_STALE_DAYS}）",
+    )
     return parser
 
 
@@ -73,6 +115,12 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--top 不能为负数")
     if args.max_depth is not None and args.max_depth < 0:
         parser.error("--max-depth 不能为负数")
+    if args.large_bytes < 0:
+        parser.error("--large-bytes 不能为负数")
+    if args.stale_days < 0:
+        parser.error("--stale-days 不能为负数")
+    if args.min_duplicate_bytes < 0:
+        parser.error("--min-duplicate-bytes 不能为负数")
 
     root = Path(args.path)
     if not root.exists():
@@ -87,7 +135,31 @@ def main(argv: list[str] | None = None) -> int:
 
     started = time.perf_counter()
     result = scan_directory(root, max_depth=args.max_depth)
+
+    duplicates: DuplicateReport | None = None
+    if not args.skip_duplicates:
+        duplicates = find_duplicates(
+            result.files, min_size=args.min_duplicate_bytes
+        )
     elapsed = time.perf_counter() - started
 
-    print(render_report(result, top=args.top, elapsed=elapsed), end="")
+    suggestions = build_suggestions(
+        result,
+        duplicates,
+        large_bytes=args.large_bytes,
+        stale_days=args.stale_days,
+    )
+
+    if args.json:
+        text = render_json(result, duplicates, suggestions, elapsed=elapsed)
+    elif args.markdown:
+        text = render_markdown(
+            result, duplicates, suggestions, top=args.top, elapsed=elapsed
+        )
+    else:
+        text = render_report(
+            result, duplicates, suggestions, top=args.top, elapsed=elapsed
+        )
+
+    print(text, end="")
     return EXIT_OK
