@@ -13,6 +13,7 @@ import time
 from pathlib import Path
 from typing import NoReturn
 
+from .apply import DEFAULT_MAX_ACTIONS, build_plan
 from .duplicates import DuplicateReport, find_duplicates
 from .report import render_json, render_markdown, render_report
 from .scan import scan_directory
@@ -83,6 +84,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="参与查重的最小体积，单位字节（默认：1，即忽略空文件）",
     )
     parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="生成执行计划（dry-run）：列出拟执行的动作与审计清单，但不执行任何改动",
+    )
+    parser.add_argument(
+        "--max-actions",
+        type=int,
+        default=DEFAULT_MAX_ACTIONS,
+        metavar="N",
+        help=f"执行计划最多列出多少个动作（默认：{DEFAULT_MAX_ACTIONS}）",
+    )
+    parser.add_argument(
         "--large-bytes",
         type=int,
         default=DEFAULT_LARGE_BYTES,
@@ -121,6 +134,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--stale-days 不能为负数")
     if args.min_duplicate_bytes < 0:
         parser.error("--min-duplicate-bytes 不能为负数")
+    if args.max_actions < 0:
+        parser.error("--max-actions 不能为负数")
 
     root = Path(args.path)
     if not root.exists():
@@ -150,15 +165,19 @@ def main(argv: list[str] | None = None) -> int:
         stale_days=args.stale_days,
     )
 
+    plan = None
+    if args.plan:
+        plan = build_plan(result, duplicates, max_actions=args.max_actions)
+
     if args.json:
-        text = render_json(result, duplicates, suggestions, elapsed=elapsed)
+        text = render_json(result, duplicates, suggestions, plan, elapsed=elapsed)
     elif args.markdown:
         text = render_markdown(
-            result, duplicates, suggestions, top=args.top, elapsed=elapsed
+            result, duplicates, suggestions, plan, top=args.top, elapsed=elapsed
         )
     else:
         text = render_report(
-            result, duplicates, suggestions, top=args.top, elapsed=elapsed
+            result, duplicates, suggestions, plan, top=args.top, elapsed=elapsed
         )
 
     print(text, end="")

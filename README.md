@@ -5,8 +5,10 @@
 
 ## 状态
 
-S1–S4 已实现：扫描统计、重复检测、JSON / Markdown 导出、建议引擎。
-S5（安全的 apply 流程）与 S6（测试硬化）待做。
+S1–S6 已实现：扫描统计、重复检测、JSON / Markdown 导出、建议引擎、执行计划。
+
+**S5 只生成计划，不执行任何改动** —— 按 Q5 的决策，v1 只输出命令。
+详见 `docs/SPEC-S5.md` 第 0 节（其中说明了 Q5 与 G7 的冲突如何取舍）。
 
 ## 运行
 
@@ -44,6 +46,8 @@ PYTHONPATH=src python3 -m homecheck / --max-depth 1 --skip-duplicates
 | `--json` | 输出 JSON（stdout 只有 JSON） | 关 |
 | `--markdown` | 输出 Markdown | 关 |
 | `--skip-duplicates` | 跳过查重，更快 | 关 |
+| `--plan` | 生成执行计划（dry-run），**不执行** | 关 |
+| `--max-actions N` | 执行计划最多列出多少个动作 | 100 |
 | `--min-duplicate-bytes N` | 参与查重的最小体积 | 1（忽略空文件） |
 | `--large-bytes N` | 大文件阈值 | 104857600（100 MB） |
 | `--stale-days N` | 陈旧阈值 | 180 |
@@ -65,6 +69,8 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 - 硬链接不虚报可回收空间
 - 建议里的删除命令一律 `shlex.quote` 转义，**绝不使用 `-r` / `-f`**，
   并且**本工具永不执行它们**
+- `--plan` 只生成计划，**不执行任何动作**。计划中的路径若位于 `.git` 等元数据目录、
+  在扫描根之外、或与保留项是硬链接，一律被拒绝并**显式列出**（不静默丢弃）
 - 完整的非目标清单见 `docs/PRODUCT.md` 第 4 节
 
 ## 文档
@@ -74,6 +80,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 | `docs/PRODUCT.md` | 做什么 / 不做什么 |
 | `docs/SPEC-S1.md` | S1 切片规格 |
 | `docs/SPEC-S2-S4.md` | S2–S4 合并规格与决策清单 D1–D14 |
+| `docs/SPEC-S5.md` | S5 规格：执行计划与 Q5/G7 冲突的取舍 |
 | `docs/DECISIONS.md` | 决策记录（ADR） |
 | `docs/CONVENTIONS.md` | 编码与协作约定 |
 | `docs/TASKS.md` | 进度 |

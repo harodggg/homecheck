@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
+from .apply import ActionPlan
 from .duplicates import DuplicateReport
 from .scan import ROOT_LABEL, ScanResult
 from .suggest import Suggestion
@@ -49,6 +50,7 @@ def render_report(
     result: ScanResult,
     duplicates: DuplicateReport | None = None,
     suggestions: Sequence[Suggestion] | None = None,
+    plan: ActionPlan | None = None,
     *,
     top: int = 20,
     timestamp: datetime | None = None,
@@ -60,6 +62,7 @@ def render_report(
         result: 扫描结果。
         duplicates: 查重结果；``None`` 表示本次未查重，跳过该小节。
         suggestions: 建议列表；``None`` 或空列表则跳过该小节。
+        plan: 执行计划；``None`` 表示未生成，跳过该小节。
         top: 体积排行、类型分布与重复组各显示前多少项。
         timestamp: 报告时间；默认取当前时间。测试中可固定以便断言。
         elapsed: 扫描耗时（秒）；``None`` 表示不显示。
@@ -91,6 +94,9 @@ def render_report(
     if suggestions:
         lines.extend(_render_suggestions(suggestions))
 
+    if plan is not None:
+        lines.extend(_render_plan(plan))
+
     if result.symlinks_skipped:
         lines.append(f"跳过符号链接（不跟随）：{result.symlinks_skipped:,} 个")
         lines.append("")
@@ -109,6 +115,7 @@ def render_json(
     result: ScanResult,
     duplicates: DuplicateReport | None = None,
     suggestions: Sequence[Suggestion] | None = None,
+    plan: ActionPlan | None = None,
     *,
     timestamp: datetime | None = None,
     elapsed: float | None = None,
@@ -116,11 +123,13 @@ def render_json(
     """把结果渲染成 JSON 文本（stdout 专用，不含任何装饰性文字）。
 
     ``schema_version`` 与字段集合是稳定契约，见 ``docs/SPEC-S2-S4.md``。
+    新增 ``plan`` 字段属纯追加变更，未递增 ``schema_version``。
 
     参数:
         result: 扫描结果。
         duplicates: 查重结果；``None`` 时输出的 ``duplicates`` 为 ``null``。
         suggestions: 建议列表。
+        plan: 执行计划；``None`` 时输出的 ``plan`` 为 ``null``。
         timestamp: 生成时间；默认取当前时间。
         elapsed: 扫描耗时（秒）。
 
@@ -159,6 +168,7 @@ def render_json(
             }
             for item in suggestions or []
         ],
+        "plan": _plan_payload(plan),
         "issues": [
             {"path": str(issue.path), "reason": issue.reason} for issue in result.issues
         ],
@@ -171,6 +181,7 @@ def render_markdown(
     result: ScanResult,
     duplicates: DuplicateReport | None = None,
     suggestions: Sequence[Suggestion] | None = None,
+    plan: ActionPlan | None = None,
     *,
     top: int = 20,
     timestamp: datetime | None = None,
@@ -269,6 +280,50 @@ def render_markdown(
             lines.append("> ⚠ 以上命令仅供参考，本工具**不会**执行任何删除。执行前请自行复核。")
             lines.append("")
 
+    if plan is not None:
+        lines.append("## 执行计划")
+        lines.append("")
+        lines.append(
+            f"共 {len(plan.actions)} 个动作，可回收 {human_size(plan.total_bytes)}。"
+        )
+        lines.append("")
+        if plan.actions:
+            lines.extend(
+                _md_table(
+                    ["#", "动作", "路径", "体积", "保留"],
+                    [
+                        [
+                            str(index),
+                            action.kind,
+                            f"`{action.path}`",
+                            human_size(action.size),
+                            f"`{action.keep}`",
+                        ]
+                        for index, action in enumerate(plan.actions, start=1)
+                    ],
+                )
+            )
+            lines.append("")
+            if plan.truncated:
+                lines.append(f"_另有 {plan.truncated} 个动作未列出。_")
+                lines.append("")
+            if plan.command:
+                lines.append("```bash")
+                lines.append(plan.command)
+                lines.append("```")
+                lines.append("")
+        else:
+            lines.append("_（无动作）_")
+            lines.append("")
+        if plan.refusals:
+            lines.append(f"**安全规则拒绝 {len(plan.refusals)} 项：**")
+            lines.append("")
+            for refusal in plan.refusals:
+                lines.append(f"- ✗ `{refusal.path}` — {refusal.reason}")
+            lines.append("")
+        lines.append("> ⚠ 本工具**不会**执行以上任何动作（Q5：v1 只输出命令）。")
+        lines.append("")
+
     if result.issues:
         lines.append(f"## 未扫描目录（{len(result.issues):,} 个）")
         lines.append("")
@@ -326,6 +381,39 @@ def _render_duplicates(duplicates: DuplicateReport, top: int) -> list[str]:
     return lines
 
 
+def _render_plan(plan: ActionPlan) -> list[str]:
+    """渲染执行计划小节。
+
+    这里展示的动作**不会被本工具执行** —— 按 Q5 的决策，v1 只输出命令。
+    """
+    lines = [
+        f"执行计划（{len(plan.actions)} 个动作，可回收 {human_size(plan.total_bytes)}）"
+    ]
+    if not plan.actions:
+        lines.append("  （无）")
+    for index, action in enumerate(plan.actions, start=1):
+        lines.append(
+            f"  {index}.  删除 {action.path}"
+            f"  （{human_size(action.size)}，保留 {action.keep}）"
+        )
+    if plan.truncated:
+        lines.append(f"  （另有 {plan.truncated} 个动作未列出，可用 --max-actions 调整）")
+    if plan.refusals:
+        lines.append(f"  安全规则拒绝 {len(plan.refusals)} 项：")
+        for refusal in plan.refusals[:5]:
+            lines.append(f"      ✗ {refusal.path} — {refusal.reason}")
+        if len(plan.refusals) > 5:
+            lines.append(f"      （另有 {len(plan.refusals) - 5} 项）")
+    if plan.command:
+        lines.append("")
+        lines.append("  复核后可一次性执行：")
+        lines.append(f"  $ {plan.command}")
+    lines.append("")
+    lines.append("  ⚠ 本工具不会执行以上任何动作（Q5：v1 只输出命令）。")
+    lines.append("")
+    return lines
+
+
 def _render_suggestions(suggestions: Sequence[Suggestion]) -> list[str]:
     """渲染建议小节，并在存在命令时附上安全警告。"""
     lines = [f"建议（{len(suggestions)} 条）"]
@@ -359,6 +447,33 @@ def _duplicates_payload(duplicates: DuplicateReport | None) -> dict[str, object]
                 "paths": [str(path) for path in group.paths],
             }
             for group in duplicates.groups
+        ],
+    }
+
+
+def _plan_payload(plan: ActionPlan | None) -> dict[str, object] | None:
+    """把执行计划转成 JSON 可序列化的结构；``None`` 表示本次未生成计划。"""
+    if plan is None:
+        return None
+    return {
+        "action_count": len(plan.actions),
+        "total_bytes": plan.total_bytes,
+        "truncated": plan.truncated,
+        "command": plan.command or None,
+        "actions": [
+            {
+                "kind": action.kind,
+                "path": str(action.path),
+                "size": action.size,
+                "digest": action.digest,
+                "keep": str(action.keep),
+                "reason": action.reason,
+            }
+            for action in plan.actions
+        ],
+        "refusals": [
+            {"path": str(refusal.path), "reason": refusal.reason}
+            for refusal in plan.refusals
         ],
     }
 

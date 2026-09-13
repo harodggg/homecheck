@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 
+from homecheck.apply import Action, ActionPlan, Refusal
 from homecheck.duplicates import DuplicateGroup, DuplicateReport
 from homecheck.report import human_size, render_json, render_markdown, render_report
 from homecheck.scan import ScanIssue, ScanResult
@@ -24,6 +25,14 @@ class HumanSizeTest(unittest.TestCase):
     def test_bytes_have_no_decimals(self) -> None:
         self.assertEqual(human_size(0), "0 B")
         self.assertEqual(human_size(512), "512 B")
+
+    def test_unit_boundaries(self) -> None:
+        self.assertEqual(human_size(0), "0 B")
+        self.assertEqual(human_size(1023), "1023 B")
+        self.assertEqual(human_size(1024), "1 KB")
+        self.assertEqual(human_size(1024**5), "1 PB")
+        # 超出最大单位时仍能渲染，不抛异常
+        self.assertEqual(human_size(1024**6), "1024 PB")
 
     def test_larger_units_use_1024_base(self) -> None:
         self.assertEqual(human_size(1024), "1 KB")
@@ -184,6 +193,36 @@ class StageSectionsTest(unittest.TestCase):
 
         self.assertNotIn("建议（", text)
 
+    def test_plan_section_is_rendered(self) -> None:
+        plan = ActionPlan(
+            root=Path("/tmp/demo"),
+            actions=[
+                Action(
+                    kind="delete-duplicate",
+                    path=Path("/tmp/demo/b"),
+                    size=5,
+                    digest="d" * 64,
+                    keep=Path("/tmp/demo/a"),
+                    reason="r",
+                )
+            ],
+            refusals=[Refusal(Path("/tmp/demo/.git/x"), "位于版本库内")],
+            truncated=2,
+        )
+
+        text = render_report(self.result(), None, None, plan, timestamp=FIXED)
+
+        self.assertIn("执行计划（1 个动作，可回收 5 B）", text)
+        self.assertIn("另有 2 个动作未列出", text)
+        self.assertIn("安全规则拒绝 1 项", text)
+        self.assertIn("$ rm -- /tmp/demo/b", text)
+        self.assertIn("本工具不会执行以上任何动作", text)
+
+    def test_no_plan_section_when_not_requested(self) -> None:
+        text = render_report(self.result(), timestamp=FIXED)
+
+        self.assertNotIn("执行计划", text)
+
     def test_no_duplicate_section_when_skipped(self) -> None:
         text = render_report(self.result(), None, None, timestamp=FIXED)
 
@@ -208,9 +247,10 @@ class RenderJsonTest(unittest.TestCase):
         result: ScanResult,
         duplicates: DuplicateReport | None = None,
         suggestions: list[Suggestion] | None = None,
+        plan: ActionPlan | None = None,
     ) -> dict:
         text = render_json(
-            result, duplicates, suggestions, timestamp=FIXED, elapsed=0.5
+            result, duplicates, suggestions, plan, timestamp=FIXED, elapsed=0.5
         )
         return json.loads(text)  # 解析成功即证明 stdout 只有 JSON
 
@@ -231,6 +271,7 @@ class RenderJsonTest(unittest.TestCase):
                 "by_extension",
                 "duplicates",
                 "suggestions",
+                "plan",
                 "issues",
                 "skipped_symlinks",
             },
@@ -307,6 +348,54 @@ class RenderJsonTest(unittest.TestCase):
         self.assertEqual(entry["bytes"], 512)
         self.assertEqual(entry["percent"], 50.0)
 
+    def test_plan_is_null_by_default(self) -> None:
+        self.assertIsNone(self.parse(self.make())["plan"])
+
+    def test_plan_payload_shape(self) -> None:
+        plan = ActionPlan(
+            root=Path("/tmp/demo"),
+            actions=[
+                Action(
+                    kind="delete-duplicate",
+                    path=Path("/a"),
+                    size=5,
+                    digest="d",
+                    keep=Path("/b"),
+                    reason="r",
+                )
+            ],
+            refusals=[Refusal(Path("/c"), "why")],
+            truncated=3,
+        )
+
+        payload = self.parse(self.make(), None, None, plan)["plan"]
+
+        self.assertEqual(
+            set(payload),
+            {
+                "action_count",
+                "total_bytes",
+                "truncated",
+                "command",
+                "actions",
+                "refusals",
+            },
+        )
+        self.assertEqual(payload["action_count"], 1)
+        self.assertEqual(payload["total_bytes"], 5)
+        self.assertEqual(payload["truncated"], 3)
+        self.assertEqual(payload["command"], "rm -- /a")
+        self.assertEqual(
+            set(payload["actions"][0]),
+            {"kind", "path", "size", "digest", "keep", "reason"},
+        )
+
+    def test_empty_plan_command_is_null(self) -> None:
+        payload = self.parse(self.make(), None, None, ActionPlan(root=Path("/tmp/demo")))["plan"]
+
+        self.assertEqual(payload["action_count"], 0)
+        self.assertIsNone(payload["command"])
+
     def test_output_is_bare_json(self) -> None:
         text = render_json(self.make(), timestamp=FIXED)
 
@@ -372,6 +461,29 @@ class RenderMarkdownTest(unittest.TestCase):
         self.assertIn("```bash", text)
         self.assertIn("rm -- /b", text)
         self.assertIn("不会**执行任何删除", text)
+
+    def test_plan_section(self) -> None:
+        plan = ActionPlan(
+            root=Path("/tmp/demo"),
+            actions=[
+                Action(
+                    kind="delete-duplicate",
+                    path=Path("/a"),
+                    size=5,
+                    digest="d",
+                    keep=Path("/b"),
+                    reason="r",
+                )
+            ],
+        )
+
+        text = render_markdown(
+            ScanResult(root=Path("/tmp/demo")), None, None, plan, timestamp=FIXED
+        )
+
+        self.assertIn("## 执行计划", text)
+        self.assertIn("rm -- /a", text)
+        self.assertIn("不会**执行以上任何动作", text)
 
     def test_no_command_warning_when_no_commands(self) -> None:
         result = ScanResult(root=Path("/tmp/demo"))

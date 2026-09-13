@@ -141,6 +141,39 @@ class ScanDirectoryTest(unittest.TestCase):
         self.assertEqual(result.issues[0].path, locked)
         self.assertIn("Permission denied", result.issues[0].reason)
 
+    def test_symlink_loop_does_not_hang(self) -> None:
+        """符号链接指回上级目录时，不得陷入无限递归。"""
+        self.write("real/f.txt", 5)
+        os.symlink(self.root, self.root / "real" / "loop")
+        os.symlink(self.root / "real", self.root / "real" / "self")
+
+        result = scan_directory(self.root)
+
+        self.assertEqual(result.file_count, 1)
+        self.assertEqual(result.total_size, 5)
+        self.assertEqual(result.symlinks_skipped, 2)
+
+    def test_filenames_with_spaces_and_unicode(self) -> None:
+        self.write("目录 带空格/文件 名.txt", 3)
+        self.write("emoji-🎉.bin", 7)
+
+        result = scan_directory(self.root)
+
+        self.assertEqual(result.file_count, 2)
+        self.assertEqual(result.total_size, 10)
+        self.assertEqual(result.size_by_suffix[".txt"], 3)
+        self.assertEqual(result.size_by_suffix[".bin"], 7)
+
+    def test_deeply_nested_tree(self) -> None:
+        """目录层级较深时不应触发递归上限。"""
+        relative = "/".join(f"d{index}" for index in range(60)) + "/leaf.txt"
+        self.write(relative, 4)
+
+        result = scan_directory(self.root)
+
+        self.assertEqual(result.file_count, 1)
+        self.assertEqual(result.total_size, 4)
+
     def test_records_file_details_for_later_stages(self) -> None:
         """S2 查重与 S4 建议依赖 files 明细，这里锁住它的形状。"""
         self.write("a/b.txt", 10)

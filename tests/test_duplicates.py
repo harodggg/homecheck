@@ -130,6 +130,30 @@ class FindDuplicatesTest(unittest.TestCase):
         self.assertEqual(len(report.issues), 1)
         self.assertIn("Permission denied", report.issues[0].reason)
 
+    def test_missing_file_is_recorded_not_fatal(self) -> None:
+        """扫描后文件被删除时，查重应记录而不是崩溃。"""
+        records = [
+            FileRecord(
+                path=self.root / "ghost1.bin",
+                size=5,
+                mtime=0.0,
+                device=1,
+                inode=1,
+            ),
+            FileRecord(
+                path=self.root / "ghost2.bin",
+                size=5,
+                mtime=0.0,
+                device=1,
+                inode=2,
+            ),
+        ]
+
+        report = find_duplicates(records)
+
+        self.assertEqual(report.groups, [])
+        self.assertEqual(len(report.issues), 2)
+
     def test_no_files_yields_empty_report(self) -> None:
         report = find_duplicates([])
 
