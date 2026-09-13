@@ -272,6 +272,7 @@ class RenderJsonTest(unittest.TestCase):
                 "duplicates",
                 "suggestions",
                 "plan",
+                "execution",
                 "issues",
                 "skipped_symlinks",
             },

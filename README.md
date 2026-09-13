@@ -5,10 +5,10 @@
 
 ## 状态
 
-S1–S6 已实现：扫描统计、重复检测、JSON / Markdown 导出、建议引擎、执行计划。
+S1–S7 已实现：扫描统计、重复检测、JSON / Markdown 导出、建议引擎、执行计划、执行。
 
-**S5 只生成计划，不执行任何改动** —— 按 Q5 的决策，v1 只输出命令。
-详见 `docs/SPEC-S5.md` 第 0 节（其中说明了 Q5 与 G7 的冲突如何取舍）。
+**工具从不删除任何东西。** `--apply` 做的是把冗余副本**移入隔离目录**（可恢复）；
+不可逆删除仍然只打印命令给你自己跑。详见 `docs/SPEC-S7.md`。
 
 ## 运行
 
@@ -48,6 +48,9 @@ PYTHONPATH=src python3 -m homecheck / --max-depth 1 --skip-duplicates
 | `--skip-duplicates` | 跳过查重，更快 | 关 |
 | `--plan` | 生成执行计划（dry-run），**不执行** | 关 |
 | `--max-actions N` | 执行计划最多列出多少个动作 | 100 |
+| `--apply` | 执行计划：把冗余副本**移入隔离目录**（可恢复） | 关 |
+| `--quarantine DIR` | 隔离目录，必须不存在或为空；`--apply` 时必填 | — |
+| `--yes` | 跳过逐条确认；非 TTY 环境下执行改动时必须给出 | 关 |
 | `--min-duplicate-bytes N` | 参与查重的最小体积 | 1（忽略空文件） |
 | `--large-bytes N` | 大文件阈值 | 104857600（100 MB） |
 | `--stale-days N` | 陈旧阈值 | 180 |
@@ -71,6 +74,11 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
   并且**本工具永不执行它们**
 - `--plan` 只生成计划，**不执行任何动作**。计划中的路径若位于 `.git` 等元数据目录、
   在扫描根之外、或与保留项是硬链接，一律被拒绝并**显式列出**（不静默丢弃）
+- **工具从不删除文件。** `--apply` 只把冗余副本移入隔离目录；执行前会重新校验
+  大小与 sha256，**如果要保留的那一份已消失或已变化，就拒绝移动** ——
+  这样永远不会出现"删掉最后一份"
+- `--apply` 需要三重授权：显式开关 + 干净的隔离目录 + 逐条确认
+  （非交互环境必须显式 `--yes`）
 - 完整的非目标清单见 `docs/PRODUCT.md` 第 4 节
 
 ## 文档
@@ -81,6 +89,7 @@ PYTHONPATH=src python3 -m unittest discover -s tests -v
 | `docs/SPEC-S1.md` | S1 切片规格 |
 | `docs/SPEC-S2-S4.md` | S2–S4 合并规格与决策清单 D1–D14 |
 | `docs/SPEC-S5.md` | S5 规格：执行计划与 Q5/G7 冲突的取舍 |
+| `docs/SPEC-S7.md` | S7 规格：执行（移入隔离目录）的授权与复核规则 |
 | `docs/DECISIONS.md` | 决策记录（ADR） |
 | `docs/CONVENTIONS.md` | 编码与协作约定 |
 | `docs/TASKS.md` | 进度 |

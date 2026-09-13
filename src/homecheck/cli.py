@@ -13,15 +13,21 @@ import time
 from pathlib import Path
 from typing import NoReturn
 
-from .apply import DEFAULT_MAX_ACTIONS, build_plan
+from typing import Callable, NoReturn
+
+from .apply import DEFAULT_MAX_ACTIONS, Action, apply_plan, build_plan
 from .duplicates import DuplicateReport, find_duplicates
-from .report import render_json, render_markdown, render_report
+from .report import human_size, render_json, render_markdown, render_report
 from .scan import scan_directory
 from .suggest import DEFAULT_LARGE_BYTES, DEFAULT_STALE_DAYS, build_suggestions
 
 EXIT_OK = 0
 EXIT_USAGE = 1
 EXIT_BAD_ROOT = 2
+#: 执行过程中有动作被拒绝（复核未通过或移动失败）
+EXIT_PARTIAL = 3
+#: 隔离目录不可用（已被占用或非空）
+EXIT_PRECONDITION = 4
 
 
 class _Parser(argparse.ArgumentParser):
@@ -96,6 +102,22 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"执行计划最多列出多少个动作（默认：{DEFAULT_MAX_ACTIONS}）",
     )
     parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="执行计划：把冗余副本移入隔离目录（可恢复；不是删除）。需要 --quarantine",
+    )
+    parser.add_argument(
+        "--quarantine",
+        metavar="DIR",
+        default=None,
+        help="隔离目录，必须不存在或为空；被移动的文件保持原相对路径，可随时移回",
+    )
+    parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过逐条确认。非交互环境（无 TTY）下执行改动时必须显式给出",
+    )
+    parser.add_argument(
         "--large-bytes",
         type=int,
         default=DEFAULT_LARGE_BYTES,
@@ -136,6 +158,16 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--min-duplicate-bytes 不能为负数")
     if args.max_actions < 0:
         parser.error("--max-actions 不能为负数")
+    if args.apply and not args.quarantine:
+        parser.error("--apply 需要同时指定 --quarantine DIR")
+    if args.quarantine and not args.apply:
+        parser.error("--quarantine 只能与 --apply 一起使用")
+    if args.apply and not args.yes and not sys.stdin.isatty():
+        print(
+            "homecheck: 非交互环境下执行改动，必须显式给出 --yes",
+            file=sys.stderr,
+        )
+        return EXIT_USAGE
 
     root = Path(args.path)
     if not root.exists():
@@ -166,19 +198,68 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     plan = None
-    if args.plan:
+    if args.plan or args.apply:
         plan = build_plan(result, duplicates, max_actions=args.max_actions)
 
+    execution = None
+    if args.apply and plan is not None:
+        confirmer = None if args.yes else _interactive_confirmer()
+        try:
+            execution = apply_plan(
+                plan,
+                quarantine=Path(str(args.quarantine)),
+                confirm=confirmer,
+            )
+        except FileExistsError as exc:
+            print(f"homecheck: {exc}", file=sys.stderr)
+            return EXIT_PRECONDITION
+
     if args.json:
-        text = render_json(result, duplicates, suggestions, plan, elapsed=elapsed)
+        text = render_json(
+            result, duplicates, suggestions, plan, execution, elapsed=elapsed
+        )
     elif args.markdown:
         text = render_markdown(
-            result, duplicates, suggestions, plan, top=args.top, elapsed=elapsed
+            result,
+            duplicates,
+            suggestions,
+            plan,
+            execution,
+            top=args.top,
+            elapsed=elapsed,
         )
     else:
         text = render_report(
-            result, duplicates, suggestions, plan, top=args.top, elapsed=elapsed
+            result,
+            duplicates,
+            suggestions,
+            plan,
+            execution,
+            top=args.top,
+            elapsed=elapsed,
         )
 
     print(text, end="")
+
+    if execution is not None and execution.refused_count:
+        return EXIT_PARTIAL
     return EXIT_OK
+
+
+def _interactive_confirmer() -> Callable[[Action, int, int], bool]:
+    """构造逐条确认回调，用于交互式执行。
+
+    提示写到 **stderr**，避免污染 ``--json`` 模式下的 stdout。
+    默认答案是"否"（直接回车即跳过），且大小写不敏感。
+    """
+
+    def confirm(action: Action, index: int, total: int) -> bool:
+        prompt = (
+            f"[{index}/{total}] 移入隔离目录：{action.path}"
+            f"（{human_size(action.size)}，保留 {action.keep}）？[y/N] "
+        )
+        print(prompt, end="", file=sys.stderr, flush=True)
+        answer = sys.stdin.readline().strip().lower()
+        return answer in {"y", "yes"}
+
+    return confirm

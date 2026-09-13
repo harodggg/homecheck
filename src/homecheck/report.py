@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Sequence
 
-from .apply import ActionPlan
+from .apply import MOVED, ActionPlan, ExecutionResult
 from .duplicates import DuplicateReport
 from .scan import ROOT_LABEL, ScanResult
 from .suggest import Suggestion
@@ -51,6 +51,7 @@ def render_report(
     duplicates: DuplicateReport | None = None,
     suggestions: Sequence[Suggestion] | None = None,
     plan: ActionPlan | None = None,
+    execution: ExecutionResult | None = None,
     *,
     top: int = 20,
     timestamp: datetime | None = None,
@@ -95,7 +96,10 @@ def render_report(
         lines.extend(_render_suggestions(suggestions))
 
     if plan is not None:
-        lines.extend(_render_plan(plan))
+        lines.extend(_render_plan(plan, executed=execution is not None))
+
+    if execution is not None:
+        lines.extend(_render_execution(execution))
 
     if result.symlinks_skipped:
         lines.append(f"跳过符号链接（不跟随）：{result.symlinks_skipped:,} 个")
@@ -116,6 +120,7 @@ def render_json(
     duplicates: DuplicateReport | None = None,
     suggestions: Sequence[Suggestion] | None = None,
     plan: ActionPlan | None = None,
+    execution: ExecutionResult | None = None,
     *,
     timestamp: datetime | None = None,
     elapsed: float | None = None,
@@ -169,6 +174,7 @@ def render_json(
             for item in suggestions or []
         ],
         "plan": _plan_payload(plan),
+        "execution": _execution_payload(execution),
         "issues": [
             {"path": str(issue.path), "reason": issue.reason} for issue in result.issues
         ],
@@ -182,6 +188,7 @@ def render_markdown(
     duplicates: DuplicateReport | None = None,
     suggestions: Sequence[Suggestion] | None = None,
     plan: ActionPlan | None = None,
+    execution: ExecutionResult | None = None,
     *,
     top: int = 20,
     timestamp: datetime | None = None,
@@ -288,13 +295,14 @@ def render_markdown(
         )
         lines.append("")
         if plan.actions:
+            action_label = "移入隔离目录" if execution is not None else "删除"
             lines.extend(
                 _md_table(
                     ["#", "动作", "路径", "体积", "保留"],
                     [
                         [
                             str(index),
-                            action.kind,
+                            action_label,
                             f"`{action.path}`",
                             human_size(action.size),
                             f"`{action.keep}`",
@@ -307,7 +315,7 @@ def render_markdown(
             if plan.truncated:
                 lines.append(f"_另有 {plan.truncated} 个动作未列出。_")
                 lines.append("")
-            if plan.command:
+            if plan.command and execution is None:
                 lines.append("```bash")
                 lines.append(plan.command)
                 lines.append("```")
@@ -321,7 +329,38 @@ def render_markdown(
             for refusal in plan.refusals:
                 lines.append(f"- ✗ `{refusal.path}` — {refusal.reason}")
             lines.append("")
-        lines.append("> ⚠ 本工具**不会**执行以上任何动作（Q5：v1 只输出命令）。")
+        if execution is None:
+            lines.append(
+                "> ⚠ 本工具**不会**执行以上任何动作。要执行请加 `--apply --quarantine DIR`。"
+            )
+        else:
+            lines.append("> → 以上动作已执行，结果见下方「执行结果」。")
+        lines.append("")
+
+    if execution is not None:
+        lines.append("## 执行结果")
+        lines.append("")
+        lines.append(f"- **隔离目录**：`{execution.quarantine}`")
+        lines.append(f"- **审计清单**：`{execution.manifest}`")
+        lines.append(
+            f"- **已移动**：{execution.moved_count} 个 / {human_size(execution.moved_bytes)}"
+        )
+        lines.append(f"- **已跳过**：{execution.skipped_count} 个（用户拒绝）")
+        lines.append(f"- **已拒绝**：{execution.refused_count} 个（复核未通过）")
+        lines.append("")
+        failures = [item for item in execution.outcomes if item.status != MOVED]
+        if failures:
+            lines.extend(
+                _md_table(
+                    ["状态", "路径", "原因"],
+                    [
+                        [item.status, f"`{item.action.path}`", item.detail]
+                        for item in failures
+                    ],
+                )
+            )
+            lines.append("")
+        lines.append("> 恢复方式：把隔离目录中的文件按原相对路径移回原位即可。")
         lines.append("")
 
     if result.issues:
@@ -381,19 +420,20 @@ def _render_duplicates(duplicates: DuplicateReport, top: int) -> list[str]:
     return lines
 
 
-def _render_plan(plan: ActionPlan) -> list[str]:
+def _render_plan(plan: ActionPlan, *, executed: bool = False) -> list[str]:
     """渲染执行计划小节。
 
-    这里展示的动作**不会被本工具执行** —— 按 Q5 的决策，v1 只输出命令。
+    *executed* 为 ``True`` 时表示该计划已经执行过，此时不再提示"不会执行"。
     """
     lines = [
         f"执行计划（{len(plan.actions)} 个动作，可回收 {human_size(plan.total_bytes)}）"
     ]
+    verb = "移入隔离目录" if executed else "删除"
     if not plan.actions:
         lines.append("  （无）")
     for index, action in enumerate(plan.actions, start=1):
         lines.append(
-            f"  {index}.  删除 {action.path}"
+            f"  {index}.  {verb} {action.path}"
             f"  （{human_size(action.size)}，保留 {action.keep}）"
         )
     if plan.truncated:
@@ -404,12 +444,39 @@ def _render_plan(plan: ActionPlan) -> list[str]:
             lines.append(f"      ✗ {refusal.path} — {refusal.reason}")
         if len(plan.refusals) > 5:
             lines.append(f"      （另有 {len(plan.refusals) - 5} 项）")
-    if plan.command:
+    if plan.command and not executed:
         lines.append("")
         lines.append("  复核后可一次性执行：")
         lines.append(f"  $ {plan.command}")
     lines.append("")
-    lines.append("  ⚠ 本工具不会执行以上任何动作（Q5：v1 只输出命令）。")
+    if executed:
+        lines.append("  → 以上动作已执行，结果见下方「执行结果」。")
+    else:
+        lines.append("  ⚠ 本工具不会执行以上任何动作。要执行请加 --apply --quarantine DIR。")
+    lines.append("")
+    return lines
+
+
+def _render_execution(execution: ExecutionResult) -> list[str]:
+    """渲染执行结果小节。
+
+    未成功的动作会逐条列出原因 —— 尤其是"保留项已变化"这类
+    本会丢数据的拒绝，必须让用户看见。
+    """
+    lines = ["执行结果（已移入隔离目录，可恢复）"]
+    lines.append(f"  隔离目录  {execution.quarantine}")
+    lines.append(f"  审计清单  {execution.manifest}")
+    lines.append(
+        f"  已移动    {execution.moved_count} 个 / {human_size(execution.moved_bytes)}"
+    )
+    lines.append(f"  已跳过    {execution.skipped_count} 个（用户拒绝）")
+    lines.append(f"  已拒绝    {execution.refused_count} 个（复核未通过）")
+    for outcome in execution.outcomes:
+        if outcome.status == MOVED:
+            continue
+        lines.append(f"      ✗ {outcome.action.path} — {outcome.detail}")
+    lines.append("")
+    lines.append("  恢复方式：把隔离目录中的文件按原相对路径移回原位即可。")
     lines.append("")
     return lines
 
@@ -474,6 +541,29 @@ def _plan_payload(plan: ActionPlan | None) -> dict[str, object] | None:
         "refusals": [
             {"path": str(refusal.path), "reason": refusal.reason}
             for refusal in plan.refusals
+        ],
+    }
+
+
+def _execution_payload(execution: ExecutionResult | None) -> dict[str, object] | None:
+    """把执行结果转成 JSON 可序列化的结构；``None`` 表示本次未执行。"""
+    if execution is None:
+        return None
+    return {
+        "quarantine": str(execution.quarantine),
+        "manifest": str(execution.manifest),
+        "moved_count": execution.moved_count,
+        "moved_bytes": execution.moved_bytes,
+        "skipped_count": execution.skipped_count,
+        "refused_count": execution.refused_count,
+        "outcomes": [
+            {
+                "status": outcome.status,
+                "path": str(outcome.action.path),
+                "size": outcome.action.size,
+                "detail": outcome.detail,
+            }
+            for outcome in execution.outcomes
         ],
     }
 
