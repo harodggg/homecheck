@@ -141,6 +141,19 @@ class ScanDirectoryTest(unittest.TestCase):
         self.assertEqual(result.issues[0].path, locked)
         self.assertIn("Permission denied", result.issues[0].reason)
 
+    def test_records_file_details_for_later_stages(self) -> None:
+        """S2 查重与 S4 建议依赖 files 明细，这里锁住它的形状。"""
+        self.write("a/b.txt", 10)
+
+        result = scan_directory(self.root)
+
+        self.assertEqual(len(result.files), 1)
+        record = result.files[0]
+        self.assertEqual(record.path.name, "b.txt")
+        self.assertEqual(record.size, 10)
+        self.assertGreater(record.inode, 0)
+        self.assertGreater(record.mtime, 0)
+
     def test_scan_does_not_modify_the_filesystem(self) -> None:
         """直接验证 S1 的核心安全承诺：扫描全程零写入。"""
         self.write("a/b.txt", 10)

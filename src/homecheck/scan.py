@@ -29,6 +29,20 @@ class ScanIssue:
     reason: str
 
 
+@dataclass(frozen=True)
+class FileRecord:
+    """单个普通文件的明细记录。
+
+    供 S2 查重（需要大小与 inode）和 S4 建议（需要大小与修改时间）消费。
+    """
+
+    path: Path
+    size: int
+    mtime: float
+    device: int
+    inode: int
+
+
 @dataclass
 class ScanResult:
     """一次扫描的完整结果。"""
@@ -41,6 +55,8 @@ class ScanResult:
     size_by_subdir: dict[str, int] = field(default_factory=dict)
     #: 小写扩展名（含点）或 ``NO_EXTENSION`` -> 体积
     size_by_suffix: dict[str, int] = field(default_factory=dict)
+    #: 所有普通文件的明细。注意：这会随文件数线性增长内存（约 1M 文件 / 100MB）
+    files: list[FileRecord] = field(default_factory=list)
     issues: list[ScanIssue] = field(default_factory=list)
     #: 被跳过的符号链接数量（Q4：不跟随符号链接）
     symlinks_skipped: int = 0
@@ -127,9 +143,19 @@ def _visit(
         return
 
     if entry.is_file(follow_symlinks=False):
-        size = entry.stat(follow_symlinks=False).st_size
+        stat = entry.stat(follow_symlinks=False)
+        size = stat.st_size
         result.file_count += 1
         result.total_size += size
+        result.files.append(
+            FileRecord(
+                path=Path(entry.path),
+                size=size,
+                mtime=stat.st_mtime,
+                device=stat.st_dev,
+                inode=stat.st_ino,
+            )
+        )
         result.size_by_subdir[top_label] = (
             result.size_by_subdir.get(top_label, 0) + size
         )
